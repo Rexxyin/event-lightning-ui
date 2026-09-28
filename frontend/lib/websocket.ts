@@ -3,6 +3,21 @@ export type LightAction =
   | 'flash'
   | 'off';
 
+export type PatternType =
+  | 'pulse'
+  | 'wave'
+  | 'ripple'
+  | 'chase'
+  | 'spark'
+  | 'comet'
+  | 'finale';
+
+export interface PatternConfig {
+  type: PatternType;
+  intensity: number;
+  seed: number;
+}
+
 export interface LightCommand {
   type: 'command';
   action: LightAction;
@@ -10,6 +25,7 @@ export interface LightCommand {
   duration: number;
   timestamp: number;
   sequence: number;
+  pattern?: PatternConfig;
 }
 
 export interface JoinedMessage {
@@ -30,16 +46,36 @@ export type ServerMessage =
   | JoinedMessage
   | PongMessage;
 
+export type AudienceEvent =
+  | {
+      type: 'tap';
+      timestamp?: number;
+    }
+  | {
+      type: 'ping';
+      timestamp: number;
+    };
+
+export interface CrowdStats {
+  totalTaps: number;
+  tapsLastSecond: number;
+  tapsLast5Seconds: number;
+  tapsLast10Seconds: number;
+  energy: number;
+  activeConnections: number;
+  updatedAt: number;
+}
+
 export function createSocket(
   zone: string,
-  row?: string
+  row?: string,
 ) {
   const base =
     process.env.NEXT_PUBLIC_WS_URL;
 
   if (!base) {
     throw new Error(
-      'NEXT_PUBLIC_WS_URL is not configured'
+      'NEXT_PUBLIC_WS_URL is not configured',
     );
   }
 
@@ -52,4 +88,44 @@ export function createSocket(
   }
 
   return new WebSocket(url.toString());
+}
+
+export function sendTap(
+  socket: WebSocket | null,
+) {
+  if (
+    !socket ||
+    socket.readyState !== WebSocket.OPEN
+  ) {
+    return false;
+  }
+
+  socket.send(
+    JSON.stringify({
+      type: 'tap',
+      timestamp: Date.now(),
+    } satisfies AudienceEvent),
+  );
+
+  return true;
+}
+
+export function sendPing(
+  socket: WebSocket | null,
+) {
+  if (
+    !socket ||
+    socket.readyState !== WebSocket.OPEN
+  ) {
+    return false;
+  }
+
+  socket.send(
+    JSON.stringify({
+      type: 'ping',
+      timestamp: Date.now(),
+    } satisfies AudienceEvent),
+  );
+
+  return true;
 }
