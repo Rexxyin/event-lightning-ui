@@ -1,5 +1,4 @@
 'use client';
-
 import {
   useCallback,
   useEffect,
@@ -7,36 +6,6 @@ import {
   useRef,
   useState,
 } from 'react';
-
-type Action = 'solid' | 'flash' | 'off';
-
-type ZoneStats = {
-  total: number;
-  rows: Record<string, number>;
-};
-
-type Stats = {
-  total: number;
-  zones: Record<string, ZoneStats>;
-};
-
-type CommandResponse = {
-  success?: boolean;
-  recipients?: number;
-  target?: {
-    zone: string;
-    row?: string;
-  };
-  command?: {
-    action: Action;
-    color: string;
-    duration: number;
-    timestamp: number;
-    sequence: number;
-  };
-  error?: string;
-};
-
 const COLORS = [
   { key: 'R', name: 'RED', value: '#FF1744' },
   { key: 'B', name: 'BLUE', value: '#2979FF' },
@@ -46,1230 +15,652 @@ const COLORS = [
   { key: 'Y', name: 'YELLOW', value: '#FFD600' },
   { key: 'C', name: 'CYAN', value: '#00E5FF' },
 ];
-
-const DEFAULT_COLOR = COLORS[0];
-
-function sortNatural(a: string, b: string) {
+const PATTERNS = [
+  { type: 'pulse', label: 'PULSE', description: 'Center expands and breathes.' },
+  { type: 'wave', label: 'WAVE', description: 'Rotating bands sweep the screen.' },
+  { type: 'ripple', label: 'RIPPLE', description: 'Concentric rings spread outward.' },
+  { type: 'chase', label: 'CHASE', description: 'Directional beams circle the screen.' },
+  { type: 'spark', label: 'SPARK', description: 'Fast scattered hits.' },
+  { type: 'comet', label: 'COMET', description: 'One bright diagonal sweep.' },
+  { type: 'finale', label: 'FINALE', description: 'Dense high-energy radial hit.' },
+] as const;
+type Action = 'solid' | 'flash' | 'off';
+type PatternType = (typeof PATTERNS)[number]['type'];
+type ZoneStats = {
+  total: number;
+  rows: Record<string, number>;
+};
+type CrowdStats = {
+  totalTaps: number;
+  tapsLastSecond: number;
+  tapsLast5Seconds: number;
+  tapsLast10Seconds: number;
+  energy: number;
+  activeConnections: number;
+  updatedAt: number;
+};
+type Stats = {
+  status: string;
+  serverTime: number;
+  total: number;
+  zones: Record<string, ZoneStats>;
+  crowd: CrowdStats;
+};
+type CommandResponse = {
+  success?: boolean;
+  recipients?: number;
+  target?: { zone: string; row?: string };
+  command?: {
+    action: Action;
+    color: string;
+    duration: number;
+    timestamp: number;
+    sequence: number;
+    pattern?: {
+      type: PatternType;
+      intensity: number;
+      seed: number;
+    };
+  };
+  error?: string;
+};
+type LastFire = {
+  recipients: number;
+  timestamp: number;
+  label: string;
+  action: Action;
+  color: string;
+  pattern?: PatternType;
+};
+const DEFAULT_COLOR = COLORS[0].value;
+const DEFAULT_PATTERN: PatternType = 'pulse';
+const REQUEST_TIMEOUT_MS = 5000;
+function natural(a: string, b: string) {
   return a.localeCompare(b, undefined, {
     numeric: true,
     sensitivity: 'base',
   });
 }
-
+function requestWithTimeout(input: RequestInfo | URL, init?: RequestInit) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => {
+    window.clearTimeout(timer);
+  });
+}
 export default function AdminPage() {
   const [stats, setStats] = useState<Stats | null>(null);
-
-  const [selectedZones, setSelectedZones] = useState<Set<string>>(
-    new Set(),
-  );
-
-  const [selectedRows, setSelectedRows] = useState<Set<string>>(
-    new Set(),
-  );
-
+  const [selectedZones, setSelectedZones] = useState<Set<string>>(new Set());
+  const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const [color, setColor] = useState(DEFAULT_COLOR);
-
   const [action, setAction] = useState<Action>('flash');
-
   const [duration, setDuration] = useState(500);
-
+  const [patternType, setPatternType] = useState<PatternType>(DEFAULT_PATTERN);
+  const [patternEnabled, setPatternEnabled] = useState(true);
+  const [patternIntensity, setPatternIntensity] = useState(0.85);
   const [loading, setLoading] = useState(true);
   const [firing, setFiring] = useState(false);
-
-  const [lastFire, setLastFire] = useState<{
-    recipients: number;
-    timestamp: number;
-    targetLabel: string;
-  } | null>(null);
-
+  const [lastFire, setLastFire] = useState<LastFire | null>(null);
   const [error, setError] = useState<string | null>(null);
-
   const lastFireRef = useRef(0);
-
-  /**
-   * ------------------------------------------------------------
-   * LOAD STATS
-   * ------------------------------------------------------------
-   */
-
+  const zones = useMemo(
+    () => Object.keys(stats?.zones ?? {}).sort(natural),
+    [stats],
+  );
+  const rows = useMemo(() => {
+    const result = new Set<string>();
+    for (const zone of zones) {
+      Object.keys(stats?.zones[zone]?.rows ?? {}).forEach(row => result.add(row));
+    }
+    return [...result].sort(natural);
+  }, [stats, zones]);
+  const selectedZoneLabel = useMemo(() => {
+    if (!selectedZones.size) return 'NO ZONE';
+    if (selectedZones.size === zones.length && zones.length) return 'ALL ZONES';
+    if (selectedZones.size === 1) return `ZONE ${[...selectedZones][0]}`;
+    return `${selectedZones.size} ZONES`;
+  }, [selectedZones, zones.length]);
+  const targetLabel = useMemo(() => {
+    const zoneLabel = selectedZoneLabel;
+    if (!selectedRows.size) return zoneLabel;
+    if (selectedRows.size === rows.length && rows.length) return `${zoneLabel} · ALL ROWS`;
+    if (selectedRows.size === 1) return `${zoneLabel} · ROW ${[...selectedRows][0]}`;
+    return `${zoneLabel} · ${selectedRows.size} ROWS`;
+  }, [rows.length, selectedRows, selectedZoneLabel]);
   const loadStats = useCallback(async () => {
     try {
-      const response = await fetch('/api/stats', {
-        cache: 'no-store',
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data?.error || 'Unable to load event stats',
-        );
-      }
-
+      const response = await requestWithTimeout('/api/stats', { cache: 'no-store' });
+      const data = (await response.json()) as Stats & { error?: string };
+      if (!response.ok) throw new Error(data.error || 'Unable to load event stats');
       setStats(data);
       setError(null);
-
-      return data as Stats;
     } catch (err) {
-      const message =
-        err instanceof Error
-          ? err.message
-          : 'Unable to load event stats';
-
-      setError(message);
-      return null;
+      setError(
+        err instanceof Error && err.name === 'AbortError'
+          ? 'Realtime server timed out'
+          : err instanceof Error
+            ? err.message
+            : 'Unable to load event stats',
+      );
     } finally {
       setLoading(false);
     }
   }, []);
-
   useEffect(() => {
-    loadStats();
-
-    const interval = window.setInterval(
-      loadStats,
-      5000,
-    );
-
-    return () => {
-      window.clearInterval(interval);
-    };
+    void loadStats();
+    const id = window.setInterval(() => void loadStats(), 1200);
+    return () => window.clearInterval(id);
   }, [loadStats]);
-
-  /**
-   * ------------------------------------------------------------
-   * AVAILABLE ZONES / ROWS
-   * ------------------------------------------------------------
-   */
-
-  const zones = useMemo(() => {
-    if (!stats) return [];
-
-    return Object.keys(stats.zones).sort(sortNatural);
-  }, [stats]);
-
-  const allRows = useMemo(() => {
-    if (!stats) return [];
-
-    const rows = new Set<string>();
-
-    for (const zone of zones) {
-      Object.keys(stats.zones[zone]?.rows ?? {}).forEach(
-        row => rows.add(row),
-      );
-    }
-
-    return Array.from(rows).sort(sortNatural);
-  }, [stats, zones]);
-
-  /**
-   * Keep selections valid when stats change.
-   */
   useEffect(() => {
-    if (!stats) return;
-
+    if (!zones.length) return;
     setSelectedZones(previous => {
-      const next = new Set(
-        Array.from(previous).filter(zone =>
-          zones.includes(zone),
-        ),
-      );
-
-      return next;
+      const valid = new Set([...previous].filter(zone => zones.includes(zone)));
+      return valid.size ? valid : new Set(zones);
     });
-
-    setSelectedRows(previous => {
-      const next = new Set(
-        Array.from(previous).filter(row =>
-          allRows.includes(row),
-        ),
-      );
-
-      return next;
-    });
-  }, [stats, zones, allRows]);
-
-  /**
-   * ------------------------------------------------------------
-   * TARGET SELECTION
-   * ------------------------------------------------------------
-   */
-
-  const selectAllZones = useCallback(() => {
-    setSelectedZones(
-      previous => {
-        if (previous.size === zones.length) {
-          return new Set();
-        }
-
-        return new Set(zones);
-      },
-    );
   }, [zones]);
-
-  const toggleZone = useCallback(
-    (zone: string) => {
-      setSelectedZones(previous => {
-        const next = new Set(previous);
-
-        if (next.has(zone)) {
-          next.delete(zone);
-        } else {
-          next.add(zone);
-        }
-
-        return next;
-      });
-    },
-    [],
-  );
-
-  const clearZones = useCallback(() => {
-    setSelectedZones(new Set());
+  useEffect(() => {
+    setSelectedRows(previous => new Set([...previous].filter(row => rows.includes(row))));
+  }, [rows]);
+  const toggleZone = useCallback((zone: string) => {
+    setSelectedZones(previous => {
+      const next = new Set(previous);
+      next.has(zone) ? next.delete(zone) : next.add(zone);
+      return next;
+    });
   }, []);
-
   const toggleRow = useCallback((row: string) => {
     setSelectedRows(previous => {
       const next = new Set(previous);
-
-      if (next.has(row)) {
-        next.delete(row);
-      } else {
-        next.add(row);
-      }
-
+      next.has(row) ? next.delete(row) : next.add(row);
       return next;
     });
   }, []);
-
+  const selectAllZones = useCallback(() => {
+    setSelectedZones(previous =>
+      previous.size === zones.length ? new Set() : new Set(zones),
+    );
+  }, [zones]);
   const selectAllRows = useCallback(() => {
-    setSelectedRows(previous => {
-      if (previous.size === allRows.length) {
-        return new Set();
-      }
-
-      return new Set(allRows);
-    });
-  }, [allRows]);
-
-  const clearRows = useCallback(() => {
-    setSelectedRows(new Set());
-  }, []);
-
-  /**
-   * ------------------------------------------------------------
-   * TARGET DESCRIPTION
-   * ------------------------------------------------------------
-   */
-
-  const targetLabel = useMemo(() => {
-    if (selectedZones.size === 0) {
-      return 'NO TARGET';
-    }
-
-    const zoneNames = Array.from(selectedZones).sort(
-      sortNatural,
+    setSelectedRows(previous =>
+      previous.size === rows.length ? new Set() : new Set(rows),
     );
-
-    const zoneLabel =
-      zoneNames.length === zones.length
-        ? 'ALL ZONES'
-        : zoneNames.length === 1
-          ? `ZONE ${zoneNames[0]}`
-          : `${zoneNames.length} ZONES`;
-
-    if (selectedRows.size === 0) {
-      return zoneLabel;
-    }
-
-    const rowNames = Array.from(selectedRows).sort(
-      sortNatural,
-    );
-
-    const rowLabel =
-      rowNames.length === allRows.length
-        ? 'ALL ROWS'
-        : rowNames.length === 1
-          ? `ROW ${rowNames[0]}`
-          : `${rowNames.length} ROWS`;
-
-    return `${zoneLabel} · ${rowLabel}`;
-  }, [
-    selectedZones,
-    selectedRows,
-    zones.length,
-    allRows.length,
-  ]);
-
-  /**
-   * ------------------------------------------------------------
-   * COMMAND SENDING
-   * ------------------------------------------------------------
-   */
-
+  }, [rows]);
   const fire = useCallback(
     async (overrideAction?: Action) => {
-      if (selectedZones.size === 0) {
+      const nextAction = overrideAction ?? action;
+      const zonesNow = [...selectedZones].sort(natural);
+      if (!zonesNow.length) {
         setError('Select at least one zone.');
         return;
       }
-
-      /**
-       * Prevent keyboard repeat / accidental double fire.
-       *
-       * This is deliberately very small because a concert
-       * controller needs to remain extremely responsive.
-       */
-      const now = performance.now();
-
-      if (now - lastFireRef.current < 100) {
-        return;
-      }
-
+      const now = Date.now();
+      if (now - lastFireRef.current < 100) return;
       lastFireRef.current = now;
-
       setFiring(true);
       setError(null);
-
-      const zonesToFire = Array.from(selectedZones).sort(
-        sortNatural,
-      );
-
-      const rowsToFire =
-        selectedRows.size > 0
-          ? Array.from(selectedRows).sort(sortNatural)
-          : [undefined];
-
-      try {
-        /**
-         * Important:
-         *
-         * We intentionally send commands in parallel.
-         *
-         * If A + C + D are selected, the browser fires all
-         * commands at approximately the same time instead of
-         * waiting for A to finish before sending C.
-         */
-        const requests: Promise<Response>[] = [];
-
-        for (const zone of zonesToFire) {
-          for (const row of rowsToFire) {
-            requests.push(
-              fetch('/api/command', {
-                method: 'POST',
-                headers: {
-                  'Content-Type':
-                    'application/json',
-                },
-                body: JSON.stringify({
-                  zone,
-                  ...(row
-                    ? { row }
-                    : {}),
-                  action:
-                    overrideAction ?? action,
-                  color: color.value,
-                  duration:
-                    overrideAction === 'off'
-                      ? 0
-                      : duration,
-                }),
-              }),
-            );
+      const rowsNow = selectedRows.size
+        ? [...selectedRows].sort(natural)
+        : [undefined];
+      // One global command is the cleanest and lowest-latency path.
+      // When rows are selected, commands are sent per zone because the server
+      // intentionally treats "all" as all rows too.
+      const useGlobal = zonesNow.length === zones.length && rowsNow.length === 1 && !rowsNow[0];
+      const targets: Array<{ zone: string; row?: string }> = [];
+      if (useGlobal) {
+        targets.push({ zone: 'all' });
+      } else {
+        for (const zone of zonesNow) {
+          for (const row of rowsNow) {
+            targets.push(row ? { zone, row } : { zone });
           }
         }
-
+      }
+      const pattern =
+        patternEnabled && nextAction !== 'off'
+          ? {
+              type: patternType,
+              intensity: Math.max(0, Math.min(1, patternIntensity)),
+              seed: Math.floor(Math.random() * 1_000_000_000),
+            }
+          : undefined;
+      try {
         const responses = await Promise.all(
-          requests,
+          targets.map(target =>
+            requestWithTimeout('/api/command', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                ...target,
+                action: nextAction,
+                color,
+                duration: nextAction === 'flash' ? duration : 0,
+                ...(pattern ? { pattern } : {}),
+              }),
+            }).then(async response => {
+              const data = (await response.json()) as CommandResponse;
+              if (!response.ok) throw new Error(data.error || 'Lighting command failed');
+              return data;
+            }),
+          ),
         );
-
-        const payloads: CommandResponse[] =
-          await Promise.all(
-            responses.map(response =>
-              response.json(),
-            ),
-          );
-
-        const failed = payloads.find(
-          payload => payload.error,
-        );
-
-        if (failed?.error) {
-          throw new Error(failed.error);
-        }
-
-        const recipients = payloads.reduce(
-          (total, payload) =>
-            total + (payload.recipients ?? 0),
+        const recipientCount = responses.reduce(
+          (total, response) => total + Number(response.recipients ?? 0),
           0,
         );
-
         setLastFire({
-          recipients,
+          recipients: recipientCount,
           timestamp: Date.now(),
-          targetLabel,
+          label: targetLabel,
+          action: nextAction,
+          color,
+          pattern: pattern?.type,
         });
       } catch (err) {
-        const message =
-          err instanceof Error
-            ? err.message
-            : 'Command failed';
-
-        setError(message);
+        setError(
+          err instanceof Error && err.name === 'AbortError'
+            ? 'Realtime server timed out'
+            : err instanceof Error
+              ? err.message
+              : 'Lighting command failed',
+        );
       } finally {
         setFiring(false);
       }
     },
-    [
-      selectedZones,
-      selectedRows,
-      action,
-      color,
-      duration,
-      targetLabel,
-    ],
+    [action, color, duration, patternEnabled, patternIntensity, patternType, selectedRows, selectedZones, targetLabel, zones.length],
   );
-
-  /**
-   * ------------------------------------------------------------
-   * KEYBOARD CONTROL
-   * ------------------------------------------------------------
-   *
-   * Main show-control interaction:
-   *
-   * A/B/C/D -> toggle zone
-   * 1/2/3... -> toggle row
-   * 0 -> all rows
-   * R/B/G/P/W/Y/C -> color
-   * SPACE -> fire
-   * S -> solid
-   * X -> off
-   * ESC -> clear rows
-   *
-   * Shift + zone key also toggles zone.
-   *
-   * This means the operator can keep both hands on the
-   * keyboard/controller and fire without reaching for UI.
-   */
-
   useEffect(() => {
-    function handleKeyDown(
-      event: KeyboardEvent,
-    ) {
+    const handler = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
-
-      /**
-       * Never hijack typing inside an input/select.
-       */
       if (
         target?.tagName === 'INPUT' ||
         target?.tagName === 'TEXTAREA' ||
-        target?.tagName === 'SELECT' ||
         target?.isContentEditable
       ) {
         return;
       }
-
-      const key = event.key.toLowerCase();
-
-      /**
-       * SPACE = FIRE
-       */
+      const key = event.key.toUpperCase();
+      if (/^[A-Z]$/.test(key)) {
+        const zone = zones.find(item => item.toUpperCase() === key);
+        if (zone) toggleZone(zone);
+        return;
+      }
+      if (/^[1-9]$/.test(event.key)) {
+        const row = rows[Number(event.key) - 1];
+        if (row) toggleRow(row);
+        return;
+      }
+      if (event.key === '0') {
+        event.preventDefault();
+        selectAllRows();
+        return;
+      }
+      const colorMatch = COLORS.find(item => item.key === key);
+      if (colorMatch) {
+        setColor(colorMatch.value);
+        return;
+      }
+      if (key === 'F') {
+        event.preventDefault();
+        void fire('flash');
+        return;
+      }
+      if (key === 'S') {
+        event.preventDefault();
+        void fire('solid');
+        return;
+      }
+      if (key === 'X') {
+        event.preventDefault();
+        void fire('off');
+        return;
+      }
+      if (event.key === 'Escape') {
+        setSelectedRows(new Set());
+      }
       if (event.code === 'Space') {
         event.preventDefault();
-
-        if (!event.repeat) {
-          void fire();
-        }
-
-        return;
+        void fire();
       }
-
-      /**
-       * ESC = clear rows
-       */
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        clearRows();
-        return;
-      }
-
-      /**
-       * ALL ZONES
-       */
-      if (key === 'a') {
-        /**
-         * If there is a real zone "A", toggle it.
-         *
-         * Ctrl/Cmd + A is reserved for selecting all zones.
-         */
-        if (event.metaKey || event.ctrlKey) {
-          event.preventDefault();
-          selectAllZones();
-          return;
-        }
-
-        if (zones.includes('A')) {
-          event.preventDefault();
-          toggleZone('A');
-          return;
-        }
-      }
-
-      /**
-       * B/C/D/E/F/G... zones
-       */
-      if (/^[a-z]$/.test(key)) {
-        const matchingZone = zones.find(
-          zone =>
-            zone.toLowerCase() === key,
-        );
-
-        /**
-         * Don't treat color shortcuts as zone shortcuts.
-         */
-        const isColorShortcut = COLORS.some(
-          item =>
-            item.key.toLowerCase() === key,
-        );
-
-        if (
-          matchingZone &&
-          !isColorShortcut
-        ) {
-          event.preventDefault();
-          toggleZone(matchingZone);
-          return;
-        }
-      }
-
-      /**
-       * Number keys = rows
-       *
-       * 0 = all rows
-       * 1–9 = individual rows
-       */
-      if (/^[0-9]$/.test(key)) {
-        event.preventDefault();
-
-        if (key === '0') {
-          selectAllRows();
-          return;
-        }
-
-        const matchingRow = allRows.find(
-          row => row === key,
-        );
-
-        if (matchingRow) {
-          toggleRow(matchingRow);
-        }
-
-        return;
-      }
-
-      /**
-       * COLOR SHORTCUTS
-       */
-      const selectedColor = COLORS.find(
-        item =>
-          item.key.toLowerCase() === key,
-      );
-
-      if (selectedColor) {
-        event.preventDefault();
-        setColor(selectedColor);
-        return;
-      }
-
-      /**
-       * ACTION SHORTCUTS
-       */
-      if (key === 's') {
-        event.preventDefault();
-        setAction('solid');
-        return;
-      }
-
-      if (key === 'x') {
-        event.preventDefault();
-        setAction('off');
-        return;
-      }
-
-      /**
-       * F = flash
-       */
-      if (key === 'f') {
-        event.preventDefault();
-        setAction('flash');
-      }
-    }
-
-    window.addEventListener(
-      'keydown',
-      handleKeyDown,
-    );
-
-    return () => {
-      window.removeEventListener(
-        'keydown',
-        handleKeyDown,
-      );
     };
-  }, [
-    zones,
-    allRows,
-    fire,
-    toggleZone,
-    toggleRow,
-    selectAllZones,
-    selectAllRows,
-    clearRows,
-  ]);
-
-  /**
-   * ------------------------------------------------------------
-   * RENDER
-   * ------------------------------------------------------------
-   */
-
-  if (loading) {
-    return (
-      <main className="min-h-screen bg-zinc-950 text-zinc-100">
-        <div className="flex min-h-screen items-center justify-center">
-          <div className="font-mono text-xs uppercase tracking-[0.18em] text-zinc-500">
-            Loading control surface...
-          </div>
-        </div>
-      </main>
-    );
-  }
-
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [fire, rows, selectAllRows, toggleRow, toggleZone, zones]);
   return (
-    <main className="min-h-screen bg-[#09090b] text-zinc-100 selection:bg-white selection:text-black">
-      <div className="mx-auto flex min-h-screen w-full max-w-[1500px] flex-col">
-        {/* --------------------------------------------------- */}
-        {/* HEADER */}
-        {/* --------------------------------------------------- */}
-
-        <header className="flex min-h-16 items-center justify-between border-b border-zinc-800/80 px-5 md:px-8">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-700 bg-zinc-900 font-mono text-[10px] font-bold">
-              LF
-            </div>
-
-            <div>
-              <div className="text-sm font-semibold tracking-tight">
-                LIVE CONTROL
-              </div>
-
-              <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-zinc-500">
-                Event lighting
-              </div>
-            </div>
+    <main className="min-h-screen bg-[#050505] text-white">
+      <div className="mx-auto min-h-screen max-w-[1500px] px-4 py-4 md:px-6 md:py-6">
+        <header className="mb-5 flex flex-col gap-3 border-b border-white/10 pb-4 md:flex-row md:items-end md:justify-between">
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-lime-300/60">
+              EVENT CONTROL // REALTIME LIGHTING
+            </p>
+            <h1 className="mt-1 text-2xl font-semibold tracking-[-0.03em] md:text-3xl">
+              Show control
+            </h1>
           </div>
-
-          <div className="flex items-center gap-5">
-            <div className="hidden text-right sm:block">
-              <div className="font-mono text-[9px] uppercase tracking-[0.16em] text-zinc-600">
-                Connected
-              </div>
-
-              <div className="font-mono text-xs text-zinc-300">
-                {stats?.total ?? 0}
-              </div>
-            </div>
-
-            <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-emerald-400">
-              <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-              Live
-            </div>
+          <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-white/40">
+            <span className={`h-2 w-2 rounded-full ${error ? 'bg-red-400' : loading ? 'bg-yellow-300' : 'bg-lime-300'}`} />
+            {error ? 'LINK ERROR' : loading ? 'CONNECTING' : 'LIVE'}
+            <span className="text-white/15">/</span>
+            {stats?.total ?? 0} PHONES
           </div>
         </header>
-
-        {/* --------------------------------------------------- */}
-        {/* CONTROL AREA */}
-        {/* --------------------------------------------------- */}
-
-        <div className="grid flex-1 grid-cols-1 gap-0 lg:grid-cols-[1fr_340px]">
-          {/* MAIN CONSOLE */}
-
-          <section className="min-w-0 border-b border-zinc-800/80 lg:border-r lg:border-b-0">
-            <div className="space-y-7 p-5 md:p-8">
-              {/* TARGET */}
-
-              <section>
-                <div className="mb-3 flex items-end justify-between">
-                  <div>
-                    <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
-                      Target
-                    </div>
-
-                    <div className="mt-1 text-xl font-semibold tracking-tight">
-                      Select audience
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={selectAllZones}
-                    className={[
-                      'rounded-md border px-3 py-2 font-mono text-[10px] uppercase tracking-[0.12em] transition',
-                      selectedZones.size ===
-                      zones.length
-                        ? 'border-white bg-white text-black'
-                        : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-500 hover:text-white',
-                    ].join(' ')}
-                  >
-                    {selectedZones.size ===
-                    zones.length
-                      ? 'All armed'
-                      : 'All zones'}
-                  </button>
+        <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)\_340px]">
+          <div className="space-y-4">
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4 md:p-5">
+              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/35">TARGETS</p>
+                  <div className="mt-1 text-lg font-medium">{targetLabel}</div>
                 </div>
-
-                <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
-                  {zones.map(zone => {
-                    const selected =
-                      selectedZones.has(zone);
-
-                    const zoneStats =
-                      stats?.zones?.[zone];
-
+                <button
+                  type="button"
+                  onClick={selectAllZones}
+                  className="rounded-lg border border-white/10 px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-white/55 transition hover:border-white/25 hover:text-white"
+                >
+                  {selectedZones.size === zones.length ? 'CLEAR ZONES' : 'ALL ZONES'}
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {zones.length ? (
+                  zones.map(zone => {
+                    const selected = selectedZones.has(zone);
                     return (
                       <button
                         key={zone}
                         type="button"
-                        onClick={() =>
-                          toggleZone(zone)
-                        }
-                        aria-pressed={selected}
-                        className={[
-                          'group relative min-h-[96px] overflow-hidden rounded-xl border text-left transition active:scale-[0.98]',
+                        onClick={() => toggleZone(zone)}
+                        className={`min-w-14 rounded-xl border px-4 py-3 font-mono text-xs font-semibold transition ${
                           selected
-                            ? 'border-white bg-white text-black'
-                            : 'border-zinc-800 bg-zinc-900/60 text-zinc-300 hover:border-zinc-600 hover:bg-zinc-900',
-                        ].join(' ')}
+                            ? 'border-lime-300/60 bg-lime-300 text-black shadow-[0_0_24px_rgba(190,255,70,0.15)]'
+                            : 'border-white/10 bg-black/20 text-white/50 hover:border-white/25 hover:text-white'
+                        }`}
                       >
-                        <div className="absolute right-3 top-3">
-                          <span
-                            className={[
-                              'block h-2.5 w-2.5 rounded-full',
-                              selected
-                                ? 'bg-black'
-                                : 'bg-zinc-700',
-                            ].join(' ')}
-                          />
-                        </div>
-
-                        <div className="p-4">
-                          <div className="font-mono text-[10px] uppercase tracking-[0.16em] opacity-60">
-                            Zone
-                          </div>
-
-                          <div className="mt-1 text-3xl font-semibold tracking-tight">
-                            {zone}
-                          </div>
-
-                          <div className="mt-2 font-mono text-[9px] uppercase tracking-[0.12em] opacity-50">
-                            {zoneStats?.total ?? 0}{' '}
-                            devices
-                          </div>
-                        </div>
+                        {zone}
                       </button>
                     );
-                  })}
-                </div>
-              </section>
-
-              {/* ROWS */}
-
-              <section>
-                <div className="mb-3 flex items-end justify-between">
-                  <div>
-                    <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
-                      Rows
-                    </div>
-
-                    <div className="mt-1 text-sm text-zinc-300">
-                      Optional precision targeting
-                    </div>
+                  })
+                ) : (
+                  <div className="rounded-xl border border-dashed border-white/10 px-4 py-5 font-mono text-[10px] uppercase tracking-wider text-white/25">
+                    No audience zones connected yet
                   </div>
-
-                  <button
-                    type="button"
-                    onClick={selectAllRows}
-                    disabled={
-                      selectedZones.size === 0
-                    }
-                    className="font-mono text-[10px] uppercase tracking-[0.12em] text-zinc-500 transition hover:text-white disabled:cursor-not-allowed disabled:opacity-30"
-                  >
-                    {selectedRows.size ===
-                    allRows.length
-                      ? 'Clear rows'
-                      : 'All rows'}
-                  </button>
-                </div>
-
-                <div className="flex flex-wrap gap-2">
-                  {allRows.map(row => {
-                    const selected =
-                      selectedRows.has(row);
-
-                    return (
-                      <button
-                        key={row}
-                        type="button"
-                        onClick={() =>
-                          toggleRow(row)
-                        }
-                        disabled={
-                          selectedZones.size === 0
-                        }
-                        aria-pressed={selected}
-                        className={[
-                          'relative flex h-12 min-w-12 items-center justify-center rounded-lg border px-4 font-mono text-sm transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-25',
-                          selected
-                            ? 'border-white bg-white text-black'
-                            : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-white',
-                        ].join(' ')}
-                      >
-                        {row}
-
-                        <span className="absolute bottom-1 right-1.5 font-mono text-[7px] opacity-40">
-                          {Number(row) <= 9
-                            ? row
-                            : ''}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-
-              {/* COLOR */}
-
-              <section>
-                <div className="mb-3">
-                  <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
-                    Color
-                  </div>
-
-                  <div className="mt-1 text-sm text-zinc-300">
-                    Press a color key or tap a pad
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-4 gap-2 sm:grid-cols-7">
-                  {COLORS.map(item => {
-                    const selected =
-                      color.key === item.key;
-
-                    return (
-                      <button
-                        key={item.key}
-                        type="button"
-                        onClick={() =>
-                          setColor(item)
-                        }
-                        aria-pressed={selected}
-                        className={[
-                          'group relative flex h-20 flex-col items-center justify-center rounded-xl border transition active:scale-95',
-                          selected
-                            ? 'border-white bg-zinc-100'
-                            : 'border-zinc-800 bg-zinc-900/70 hover:border-zinc-600',
-                        ].join(' ')}
-                      >
-                        <span
-                          className="mb-2 h-5 w-5 rounded-full border border-black/20"
-                          style={{
-                            backgroundColor:
-                              item.value,
-                          }}
-                        />
-
-                        <span
-                          className={[
-                            'font-mono text-[9px] uppercase tracking-[0.12em]',
-                            selected
-                              ? 'text-black'
-                              : 'text-zinc-500 group-hover:text-zinc-200',
-                          ].join(' ')}
-                        >
-                          {item.name}
-                        </span>
-
-                        <span
-                          className={[
-                            'absolute right-2 top-2 font-mono text-[8px]',
-                            selected
-                              ? 'text-black/40'
-                              : 'text-zinc-700',
-                          ].join(' ')}
-                        >
-                          {item.key}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </section>
-
-              {/* ACTIONS */}
-
-              <section>
-                <div className="mb-3">
-                  <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-500">
-                    Action
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-3 gap-2">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAction('flash')
-                    }
-                    className={[
-                      'min-h-[76px] rounded-xl border font-mono text-xs uppercase tracking-[0.16em] transition',
-                      action === 'flash'
-                        ? 'border-white bg-white text-black'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-white',
-                    ].join(' ')}
-                  >
-                    <span className="block text-lg">
-                      FLASH
-                    </span>
-
-                    <span className="mt-1 block text-[9px] opacity-50">
-                      F
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAction('solid')
-                    }
-                    className={[
-                      'min-h-[76px] rounded-xl border font-mono text-xs uppercase tracking-[0.16em] transition',
-                      action === 'solid'
-                        ? 'border-white bg-white text-black'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-white',
-                    ].join(' ')}
-                  >
-                    <span className="block text-lg">
-                      SOLID
-                    </span>
-
-                    <span className="mt-1 block text-[9px] opacity-50">
-                      S
-                    </span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAction('off')
-                    }
-                    className={[
-                      'min-h-[76px] rounded-xl border font-mono text-xs uppercase tracking-[0.16em] transition',
-                      action === 'off'
-                        ? 'border-white bg-white text-black'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-white',
-                    ].join(' ')}
-                  >
-                    <span className="block text-lg">
-                      OFF
-                    </span>
-
-                    <span className="mt-1 block text-[9px] opacity-50">
-                      X
-                    </span>
-                  </button>
-                </div>
-              </section>
-            </div>
-          </section>
-
-          {/* ------------------------------------------------ */}
-          {/* FIRE DECK */}
-          {/* ------------------------------------------------ */}
-
-          <aside className="flex min-h-[420px] flex-col bg-zinc-950">
-            <div className="flex-1 p-5 md:p-7">
-              <div className="mb-4 font-mono text-[10px] uppercase tracking-[0.18em] text-zinc-600">
-                Armed command
+                )}
               </div>
-
-              <div
-                className={[
-                  'relative overflow-hidden rounded-2xl border p-5 transition',
-                  selectedZones.size > 0
-                    ? 'border-zinc-600 bg-zinc-900'
-                    : 'border-zinc-800 bg-zinc-900/40',
-                ].join(' ')}
-              >
-                <div className="absolute inset-x-0 top-0 h-px bg-white/20" />
-
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-[9px] uppercase tracking-[0.16em] text-zinc-500">
-                    Target
-                  </span>
-
-                  <span
-                    className={[
-                      'font-mono text-[9px] uppercase tracking-[0.16em]',
-                      selectedZones.size > 0
-                        ? 'text-emerald-400'
-                        : 'text-zinc-600',
-                    ].join(' ')}
-                  >
-                    {selectedZones.size > 0
-                      ? 'ARMED'
-                      : 'EMPTY'}
-                  </span>
-                </div>
-
-                <div className="mt-3 text-2xl font-semibold tracking-tight">
-                  {targetLabel}
-                </div>
-
-                <div className="mt-5 flex items-center gap-3">
-                  <span
-                    className="h-8 w-8 rounded-full border border-white/10"
-                    style={{
-                      backgroundColor:
-                        color.value,
-                    }}
-                  />
-
-                  <div>
-                    <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-zinc-300">
-                      {color.name}
-                    </div>
-
-                    <div className="font-mono text-[9px] text-zinc-600">
-                      {color.value}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 border-t border-zinc-800 pt-4">
-                  <div className="flex items-center justify-between">
-                    <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-zinc-600">
-                      Action
-                    </span>
-
-                    <span className="font-mono text-xs uppercase text-zinc-200">
-                      {action}
-                    </span>
-                  </div>
-
-                  {action === 'flash' && (
-                    <div className="mt-2 flex items-center justify-between">
-                      <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-zinc-600">
-                        Duration
-                      </span>
-
-                      <span className="font-mono text-xs text-zinc-300">
-                        {duration}ms
-                      </span>
-                    </div>
-                  )}
-                </div>
+              <div className="mt-5 flex flex-wrap items-center justify-between gap-2">
+                <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">ROWS</p>
+                <button
+                  type="button"
+                  onClick={selectAllRows}
+                  disabled={!rows.length}
+                  className="rounded-lg border border-white/10 px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-white/45 disabled:opacity-30"
+                >
+                  {selectedRows.size === rows.length && rows.length ? 'CLEAR ROWS' : 'ALL ROWS'}
+                </button>
               </div>
-
-              {/* FIRE */}
-
-              <button
-                type="button"
-                onClick={() => void fire()}
-                disabled={
-                  selectedZones.size === 0 ||
-                  firing
-                }
-                className={[
-                  'mt-4 flex w-full min-h-[180px] flex-col items-center justify-center rounded-2xl border transition active:scale-[0.985]',
-                  selectedZones.size > 0 &&
-                  !firing
-                    ? 'border-white bg-white text-black hover:bg-zinc-200'
-                    : 'cursor-not-allowed border-zinc-800 bg-zinc-900 text-zinc-700',
-                ].join(' ')}
-              >
-                <span className="font-mono text-[10px] uppercase tracking-[0.2em] opacity-50">
-                  {firing
-                    ? 'Transmitting'
-                    : 'Press'}
-                </span>
-
-                <span className="mt-2 text-5xl font-semibold tracking-[-0.05em]">
-                  SPACE
-                </span>
-
-                <span className="mt-3 font-mono text-[9px] uppercase tracking-[0.16em] opacity-50">
-                  {firing
-                    ? 'Sending command...'
-                    : 'Fire command'}
-                </span>
-              </button>
-
-              {/* DURATION */}
-
-              {action === 'flash' && (
-                <div className="mt-5">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="font-mono text-[9px] uppercase tracking-[0.14em] text-zinc-600">
-                      Flash duration
-                    </span>
-
-                    <span className="font-mono text-[10px] text-zinc-400">
-                      {duration}ms
-                    </span>
-                  </div>
-
-                  <input
-                    type="range"
-                    min="50"
-                    max="2000"
-                    step="50"
-                    value={duration}
-                    onChange={event =>
-                      setDuration(
-                        Number(event.target.value),
-                      )
-                    }
-                    className="w-full accent-white"
-                  />
-                </div>
-              )}
-
-              {/* ERROR */}
-
-              {error && (
-                <div className="mt-5 rounded-xl border border-red-900/50 bg-red-950/30 p-3 font-mono text-[10px] leading-relaxed text-red-400">
-                  {error}
-                </div>
-              )}
-            </div>
-
-            {/* LAST COMMAND */}
-
-            <div className="border-t border-zinc-800/80 p-5 md:p-7">
-              <div className="flex items-center justify-between">
-                <span className="font-mono text-[9px] uppercase tracking-[0.16em] text-zinc-600">
-                  Last command
-                </span>
-
-                {lastFire && (
-                  <span className="font-mono text-[9px] text-emerald-400">
-                    SENT
+              <div className="mt-3 flex flex-wrap gap-2">
+                {rows.length ? rows.map(row => (
+                  <button
+                    key={row}
+                    type="button"
+                    onClick={() => toggleRow(row)}
+                    className={`min-w-12 rounded-lg border px-3 py-2 font-mono text-[11px] transition ${
+                      selectedRows.has(row)
+                        ? 'border-white/60 bg-white text-black'
+                        : 'border-white/10 bg-black/20 text-white/45 hover:border-white/25 hover:text-white'
+                    }`}
+                  >
+                    {row}
+                  </button>
+                )) : (
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-white/20">
+                    No row data yet
                   </span>
                 )}
               </div>
-
-              {lastFire ? (
-                <div className="mt-3 flex items-center justify-between">
-                  <div>
-                    <div className="text-sm text-zinc-300">
-                      {lastFire.targetLabel}
-                    </div>
-
-                    <div className="mt-1 font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-600">
-                      {lastFire.recipients}{' '}
-                      recipients
-                    </div>
+            </section>
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4 md:p-5">
+              <div className="grid gap-5 lg:grid-cols-[1fr\_1fr]">
+                <div>
+                  <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">ACTION</p>
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    {(['flash', 'solid', 'off'] as Action[]).map(item => (
+                      <button
+                        key={item}
+                        type="button"
+                        onClick={() => setAction(item)}
+                        className={`rounded-xl border py-4 font-mono text-xs font-semibold uppercase tracking-wider transition ${
+                          action === item
+                            ? item === 'flash'
+                              ? 'border-white bg-white text-black'
+                              : item === 'solid'
+                                ? 'border-lime-300/60 bg-lime-300 text-black'
+                                : 'border-red-300/50 bg-red-300/90 text-black'
+                            : 'border-white/10 bg-black/20 text-white/45 hover:border-white/25 hover:text-white'
+                        }`}
+                      >
+                        {item}
+                      </button>
+                    ))}
                   </div>
-
-                  <div
-                    className="h-5 w-5 rounded-full"
-                    style={{
-                      backgroundColor:
-                        color.value,
-                    }}
+                  <div className="mt-4">
+                    <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-white/30">
+                      <span>Flash duration</span>
+                      <span className="text-white/65">{duration}ms</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={80}
+                      max={1500}
+                      step={10}
+                      value={duration}
+                      onChange={event => setDuration(Number(event.target.value))}
+                      className="mt-2 w-full accent-lime-300"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between">
+                    <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">COLOUR</p>
+                    <button
+                      type="button"
+                      onClick={() => setPatternEnabled(value => !value)}
+                      className={`rounded-full border px-2.5 py-1 font-mono text-[9px] uppercase tracking-wider ${
+                        patternEnabled ? 'border-lime-300/40 text-lime-300' : 'border-white/10 text-white/25'
+                      }`}
+                    >
+                      Pattern {patternEnabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  <div className="mt-3 grid grid-cols-4 gap-2 sm:grid-cols-7">
+                    {COLORS.map(item => (
+                      <button
+                        key={item.key}
+                        type="button"
+                        aria-label={item.name}
+                        onClick={() => setColor(item.value)}
+                        className={`group flex aspect-square items-center justify-center rounded-xl border transition ${
+                          color === item.value ? 'border-white/80' : 'border-white/10'
+                        }`}
+                        style={{ background: item.value, boxShadow: color === item.value ? `0 0 28px ${item.value}55` : undefined }}
+                      >
+                        <span className={`font-mono text-[9px] font-bold ${item.key === 'W' ? 'text-black' : 'text-white'}`}>
+                          {item.key}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+            {patternEnabled && (
+              <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4 md:p-5">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">PATTERN</p>
+                    <h2 className="mt-1 text-lg font-medium">What should appear on the audience screens?</h2>
+                  </div>
+                  <div className="font-mono text-[10px] uppercase tracking-wider text-lime-300/70">
+                    {patternType.toUpperCase()}
+                  </div>
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-7">
+                  {PATTERNS.map(pattern => (
+                    <button
+                      key={pattern.type}
+                      type="button"
+                      onClick={() => setPatternType(pattern.type)}
+                      className={`min-h-24 rounded-xl border p-3 text-left transition ${
+                        patternType === pattern.type
+                          ? 'border-lime-300/50 bg-lime-300/[0.08]'
+                          : 'border-white/10 bg-black/20 hover:border-white/25'
+                      }`}
+                    >
+                      <div className="font-mono text-[10px] font-semibold tracking-wider text-white/80">
+                        {pattern.label}
+                      </div>
+                      <div className="mt-2 text-[10px] leading-4 text-white/30">
+                        {pattern.description}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-5">
+                  <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-white/30">
+                    <span>Intensity</span>
+                    <span className="text-lime-300/75">{Math.round(patternIntensity * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.2}
+                    max={1}
+                    step={0.05}
+                    value={patternIntensity}
+                    onChange={event => setPatternIntensity(Number(event.target.value))}
+                    className="mt-2 w-full accent-lime-300"
                   />
                 </div>
-              ) : (
-                <div className="mt-3 font-mono text-[10px] text-zinc-700">
-                  Waiting for first command
+              </section>
+            )}
+            {error && (
+              <div className="rounded-xl border border-red-300/20 bg-red-300/[0.06] px-4 py-3 font-mono text-[10px] uppercase tracking-wider text-red-200/80">
+                {error}
+              </div>
+            )}
+            {lastFire && (
+              <div className="rounded-xl border border-lime-300/20 bg-lime-300/[0.04] px-4 py-3">
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] uppercase tracking-wider text-white/55">
+                  <span className="text-lime-300">COMMAND SENT</span>
+                  <span>{lastFire.label}</span>
+                  <span>{lastFire.action}</span>
+                  <span>{lastFire.color}</span>
+                  {lastFire.pattern && <span>{lastFire.pattern}</span>}
+                  <span>{lastFire.recipients} RECIPIENTS</span>
                 </div>
-              )}
-            </div>
-          </aside>
-        </div>
-
-        {/* --------------------------------------------------- */}
-        {/* KEYBOARD STRIP */}
-        {/* --------------------------------------------------- */}
-
-        <footer className="border-t border-zinc-800/80 bg-zinc-950 px-5 py-3 md:px-8">
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-2 font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-600">
-            <span>
-              <kbd className="text-zinc-300">
-                A–Z
-              </kbd>{' '}
-              zones
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                1–9
-              </kbd>{' '}
-              rows
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                0
-              </kbd>{' '}
-              all rows
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                R B G P W Y C
-              </kbd>{' '}
-              color
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                F
-              </kbd>{' '}
-              flash
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                S
-              </kbd>{' '}
-              solid
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                X
-              </kbd>{' '}
-              off
-            </span>
-
-            <span>
-              <kbd className="text-zinc-300">
-                ESC
-              </kbd>{' '}
-              clear rows
-            </span>
-
-            <span className="ml-auto">
-              <kbd className="text-zinc-300">
-                SPACE
-              </kbd>{' '}
-              FIRE
-            </span>
+              </div>
+            )}
           </div>
-        </footer>
+          <aside className="space-y-4">
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4">
+              <div className="flex items-center justify-between">
+                <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">CROWD ENERGY</p>
+                <span className="font-mono text-[10px] text-lime-300">{Math.round(stats?.crowd.energy ?? 0)}%</span>
+              </div>
+              <div className="mt-4 h-2 overflow-hidden rounded-full bg-white/5">
+                <div
+                  className="h-full rounded-full bg-lime-300 transition-[width] duration-200"
+                  style={{ width: `${Math.max(0, Math.min(100, stats?.crowd.energy ?? 0))}%` }}
+                />
+              </div>
+              <div className="mt-5 grid grid-cols-2 gap-2">
+                <Metric label="TAPS / SEC" value={stats?.crowd.tapsLastSecond ?? 0} />
+                <Metric label="CONNECTED" value={stats?.crowd.activeConnections ?? stats?.total ?? 0} />
+                <Metric label="5 SEC" value={stats?.crowd.tapsLast5Seconds ?? 0} />
+                <Metric label="TOTAL" value={stats?.crowd.totalTaps ?? 0} />
+              </div>
+            </section>
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4">
+              <div className="grid gap-2">
+                <button
+                  type="button"
+                  disabled={firing || !selectedZones.size}
+                  onClick={() => void fire()}
+                  className="rounded-2xl bg-lime-300 px-5 py-5 text-center font-mono text-sm font-bold uppercase tracking-[0.18em] text-black shadow-[0_0_40px_rgba(190,255,70,0.12)] transition hover:bg-lime-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {firing ? 'SENDING…' : 'FIRE SHOW'}
+                </button>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void fire('flash')}
+                    disabled={firing || !selectedZones.size}
+                    className="rounded-xl border border-white/10 bg-black/20 py-3 font-mono text-[10px] uppercase tracking-wider text-white/55 hover:border-white/25 hover:text-white disabled:opacity-30"
+                  >
+                    FLASH
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void fire('solid')}
+                    disabled={firing || !selectedZones.size}
+                    className="rounded-xl border border-white/10 bg-black/20 py-3 font-mono text-[10px] uppercase tracking-wider text-white/55 hover:border-white/25 hover:text-white disabled:opacity-30"
+                  >
+                    SOLID
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void fire('off')}
+                    disabled={firing || !selectedZones.size}
+                    className="rounded-xl border border-white/10 bg-black/20 py-3 font-mono text-[10px] uppercase tracking-wider text-white/55 hover:border-red-300/25 hover:text-red-200 disabled:opacity-30"
+                  >
+                    OFF
+                  </button>
+                </div>
+              </div>
+            </section>
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4">
+              <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">LIVE ZONE MAP</p>
+              <div className="mt-3 space-y-2">
+                {zones.length ? zones.map(zone => (
+                  <div key={zone} className="flex items-center justify-between rounded-lg border border-white/5 bg-black/20 px-3 py-2">
+                    <span className="font-mono text-[10px] uppercase tracking-wider text-white/55">ZONE {zone}</span>
+                    <span className="font-mono text-[10px] text-white/30">{stats?.zones[zone]?.total ?? 0}</span>
+                  </div>
+                )) : (
+                  <div className="font-mono text-[10px] uppercase tracking-wider text-white/20">Waiting for audience…</div>
+                )}
+              </div>
+            </section>
+            <section className="rounded-2xl border border-white/10 bg-white/[0.025] p-4">
+              <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-white/30">KEYS</p>
+              <div className="mt-3 grid grid-cols-2 gap-2 font-mono text-[9px] uppercase tracking-wider text-white/35">
+                <Key label="A-Z" text="toggle zone" />
+                <Key label="1-9" text="toggle row" />
+                <Key label="0" text="all rows" />
+                <Key label="F" text="flash" />
+                <Key label="S" text="solid" />
+                <Key label="X" text="off" />
+                <Key label="SPACE" text="fire" />
+                <Key label="ESC" text="clear rows" />
+              </div>
+            </section>
+          </aside>
+        </section>
       </div>
     </main>
+  );
+}
+function Metric({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+      <div className="font-mono text-[9px] uppercase tracking-wider text-white/25">{label}</div>
+      <div className="mt-1 text-xl font-semibold tracking-tight">{value}</div>
+    </div>
+  );
+}
+function Key({ label, text }: { label: string; text: string }) {
+  return (
+    <div className="rounded-lg border border-white/5 bg-black/15 p-2">
+      <div className="text-white/55">{label}</div>
+      <div className="mt-1 text-white/25">{text}</div>
+    </div>
   );
 }
